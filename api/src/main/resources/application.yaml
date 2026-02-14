@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: api
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+flink-cdc-admin:
+  kubernetes:
+    namespace: flink-jobs
+  flink-defaults:
+    flink-version: v1_18
+    service-account: flink
+    jar-uri: "local:///opt/flink/lib/flink-cdc-dist-3.3.0.jar"
+    entry-class: org.apache.flink.cdc.cli.CliFrontend
+    pipeline-mount-path: /opt/flink/cdc-pipeline
+  retry:
+    max-attempts: 3
+    initial-delay-ms: 1000
+    multiplier: 2.0
