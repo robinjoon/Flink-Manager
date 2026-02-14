@@ -8,12 +8,12 @@
 
 | 구성요소 | 역할 | 비고 |
 |---|---|---|
-| **Web UI (Frontend)** | 사용자 입력 폼, 작업 목록/상세 조회, 상태 표시 | React + TypeScript |
-| **Admin API Server (Backend)** | 입력 검증, YAML 생성, K8s 리소스 CRUD, 상태 조회 | Kotlin + Spring Boot |
+| **Web UI (Frontend)** | Pipeline YAML 입력, 이미지/리소스 설정, 작업 목록/상세 조회, 상태 표시 | React + TypeScript |
+| **Admin API Server (Backend)** | 입력 검증, ConfigMap/FlinkDeployment 생성, K8s 리소스 CRUD, 상태 조회 | Kotlin + Spring Boot |
 | **Kubernetes API Server** | K8s 리소스 관리의 중심. CR 생성/조회/삭제 처리 | 클러스터 내장 |
 | **Flink Kubernetes Operator** | FlinkDeployment CR을 관찰하여 Flink 클러스터를 배포/관리 | 사전 설치 필수 |
 | **Flink Cluster (JM/TM)** | 실제 Flink CDC 파이프라인 실행 | Operator가 생성 |
-| **ConfigMap** | Pipeline YAML 저장소 | Admin App이 생성 |
+| **ConfigMap** | 사용자가 제공한 Pipeline YAML 저장 | Admin App이 생성 |
 | **DB** | v0에서는 사용하지 않음. 향후 이력/감사 로그용 | 선택적 |
 
 ### 1.2 시스템 다이어그램
@@ -36,7 +36,6 @@ graph TB
         subgraph "Flink CDC Job Resources"
             CM[ConfigMap<br/>Pipeline YAML]
             FD[FlinkDeployment CR]
-            SEC[Secret<br/>접속 정보]
         end
 
         subgraph "Flink Runtime (Operator 관리)"
@@ -57,7 +56,6 @@ graph TB
     API -->|K8s API<br/>fabric8 client| K8S
     K8S --> CM
     K8S --> FD
-    K8S --> SEC
     OP -->|Watch| FD
     OP -->|Create/Manage| JM
     OP -->|Create/Manage| TM1
@@ -80,7 +78,6 @@ User ──HTTP──▶ Web UI ──REST──▶ Admin API ──K8s API─�
                                                             │
                                                             ├── ConfigMap (CRUD)
                                                             ├── FlinkDeployment (CRUD)
-                                                            ├── Secret (CRUD)
                                                             └── Pod/Event/Service (Read)
 
 Flink Operator ◀──Watch── K8s API Server ──▶ FlinkDeployment
@@ -104,18 +101,14 @@ sequenceDiagram
     participant K8S as K8s API Server
     participant OP as Flink Operator
 
-    User->>UI: 폼 입력 후 "배포" 클릭
-    UI->>API: POST /api/jobs {입력 데이터}
+    User->>UI: Pipeline YAML + 이미지 + 리소스 설정 입력 후 "배포" 클릭
+    UI->>API: POST /api/jobs {jobName, pipelineYaml, flinkImage, resources}
 
-    Note over API: 1. 입력값 검증
-    Note over API: 2. Pipeline YAML 생성
-    Note over API: 3. FlinkDeployment YAML 생성
+    Note over API: 1. 입력값 검증 (jobName 형식, YAML 비어있지 않은지, 이미지 지정 여부)
+    Note over API: 2. FlinkDeployment spec 조립 (CDC 필수 설정 자동 포함)
 
-    API->>K8S: Create ConfigMap (Pipeline YAML)
+    API->>K8S: Create ConfigMap (Pipeline YAML 원본 저장)
     K8S-->>API: ConfigMap created
-
-    API->>K8S: Create Secret (민감 정보, 선택적)
-    K8S-->>API: Secret created
 
     API->>K8S: Create FlinkDeployment CR
     K8S-->>API: FlinkDeployment created
@@ -123,7 +116,7 @@ sequenceDiagram
     API->>K8S: Patch ConfigMap (ownerReferences 추가)
     K8S-->>API: ConfigMap patched
 
-    API-->>UI: 201 Created {jobId, status: DEPLOYING}
+    API-->>UI: 201 Created {jobName, status: DEPLOYING}
     UI-->>User: "작업이 생성되었습니다" + 목록으로 이동
 
     Note over OP: Operator가 FlinkDeployment Watch
@@ -138,18 +131,30 @@ sequenceDiagram
     Note over K8S: jobStatus.state: CREATED → RECONCILING → RUNNING
 ```
 
+#### Backend가 자동 처리하는 FlinkDeployment 설정
+
+사용자는 Pipeline YAML, Docker 이미지, 리소스만 제공한다. 나머지 FlinkDeployment 세부 설정은 Backend가 자동으로 조립한다:
+
+| 자동 설정 항목 | 값 | 이유 |
+|---|---|---|
+| `flinkConfiguration.classloader.resolve-order` | `parent-first` | Flink CDC 필수 설정 |
+| `job.jarURI` | `local:///opt/flink/lib/flink-cdc-dist-*.jar` | CDC CLI 진입점 |
+| `job.entryClass` | `org.apache.flink.cdc.cli.CliFrontend` | CDC CLI 메인 클래스 |
+| `job.args` | `[/opt/flink/cdc-pipeline/pipeline.yaml]` | ConfigMap 마운트 경로 |
+| `podTemplate` | volume + volumeMount 구성 | ConfigMap을 Pod에 마운트 |
+| `metadata.labels` | `app.kubernetes.io/managed-by: flink-cdc-admin` | 리소스 식별 |
+| `metadata.ownerReferences` | ConfigMap → FlinkDeployment | 리소스 생명주기 관리 |
+
 #### 생성 흐름 상세 단계
 
 | 단계 | 주체 | 동작 | 실패 시 처리 |
 |---|---|---|---|
-| 1 | UI | 입력값 클라이언트 검증 | 폼 에러 표시 |
-| 2 | API | 입력값 서버 검증 (필수 필드, 형식) | 400 Bad Request 반환 |
-| 3 | API | Pipeline YAML 문자열 생성 | 서버 에러 반환 |
-| 4 | API | ConfigMap 생성 (K8s API) | 에러 반환, 정리 불필요 |
-| 5 | API | Secret 생성 (선택적) | ConfigMap 정리 후 에러 반환 |
-| 6 | API | FlinkDeployment CR 생성 | ConfigMap + Secret 정리 후 에러 반환 |
-| 7 | API | ConfigMap에 ownerRef 패치 | 경고 로그. GC 대신 수동 정리 필요할 수 있음 |
-| 8 | Operator | JM/TM Pod 생성 및 Job 시작 | Operator가 재시도. status에 에러 반영 |
+| 1 | UI | 입력값 클라이언트 검증 (jobName, YAML 비어있지 않은지, 이미지 필수) | 폼 에러 표시 |
+| 2 | API | 입력값 서버 검증 (jobName 형식, YAML 문자열 유효성) | 400 Bad Request 반환 |
+| 3 | API | ConfigMap 생성 (사용자 Pipeline YAML 원본 저장) | 에러 반환, 정리 불필요 |
+| 4 | API | FlinkDeployment CR 생성 (CDC 필수 설정 자동 포함) | ConfigMap 정리 후 에러 반환 |
+| 5 | API | ConfigMap에 ownerRef 패치 | 경고 로그. 삭제 시 수동 정리 필요할 수 있음 |
+| 6 | Operator | JM/TM Pod 생성 및 Job 시작 | Operator가 재시도. status에 에러 반영 |
 
 ### 2.2 삭제 흐름 (Delete)
 
@@ -167,7 +172,7 @@ sequenceDiagram
     API->>K8S: Delete FlinkDeployment
     K8S-->>API: FlinkDeployment deleted (accepted)
 
-    Note over K8S: ownerReferences에 의해<br/>ConfigMap, Secret 자동 GC
+    Note over K8S: ownerReferences에 의해<br/>ConfigMap 자동 GC
 
     OP->>K8S: FlinkDeployment 삭제 감지
     OP->>K8S: JobManager Pod 삭제
@@ -181,7 +186,7 @@ sequenceDiagram
 #### 삭제 흐름 상세
 
 1. **Admin API**가 FlinkDeployment를 삭제한다.
-2. **Kubernetes GC**가 ownerReferences를 따라 ConfigMap과 Secret을 자동 삭제한다.
+2. **Kubernetes GC**가 ownerReferences를 따라 ConfigMap을 자동 삭제한다.
 3. **Operator**가 FlinkDeployment 삭제를 감지하고 관련 Pod/Service를 정리한다.
 4. ownerReferences가 정상 설정되지 않은 경우를 대비하여, Admin API는 label selector(`app.kubernetes.io/managed-by=flink-cdc-admin, app.kubernetes.io/name={jobName}`)로 남은 리소스를 확인하고 정리하는 보조 로직을 가진다.
 
@@ -211,12 +216,15 @@ sequenceDiagram
     API->>K8S: Get FlinkDeployment
     K8S-->>API: FlinkDeployment + status
 
+    API->>K8S: Get ConfigMap (Pipeline YAML 원본)
+    K8S-->>API: ConfigMap
+
     API->>K8S: Get Events (involvedObject=FlinkDeployment)
     K8S-->>API: Events
 
     Note over API: 상세 정보 조합
 
-    API-->>UI: {상세 정보}
+    API-->>UI: {상세 정보 + Pipeline YAML 원본}
     UI-->>User: 작업 상세 화면 렌더링
 ```
 
@@ -283,6 +291,7 @@ Flink REST API는 주된 상태 소스가 아니라, 상세 화면에서 보조�
 2. **일관성 보장**: K8s 리소스 자체가 데이터 소스이므로 DB-K8s 간 불일치 문제가 원천적으로 없다.
 3. **운영 부담 최소화**: 별도 데이터베이스 운영이 불필요하다.
 4. **충분한 성능**: v0 규모(수십~수백 작업)에서 K8s API 조회 성능은 충분하다.
+5. **Pipeline YAML 보존**: ConfigMap에 저장된 원본 YAML을 상세 화면에서 바로 조회 가능.
 
 제한 사항 및 완화:
 - **검색/필터**: Label selector를 활용하여 기본적인 필터링 지원.
@@ -324,13 +333,12 @@ Admin API는 생성 전 FlinkDeployment 존재 여부를 확인하는 것이 아
 
 ### 5.3 부분 생성 실패
 
-생성 흐름의 순서: ConfigMap → Secret → FlinkDeployment → ownerRef 패치
+생성 흐름의 순서: ConfigMap → FlinkDeployment → ownerRef 패치
 
 | 실패 지점 | 정리 전략 |
 |---|---|
 | ConfigMap 생성 실패 | 정리 불필요. 에러 반환. |
-| Secret 생성 실패 | 생성된 ConfigMap 삭제 후 에러 반환. |
-| FlinkDeployment 생성 실패 | 생성된 ConfigMap + Secret 삭제 후 에러 반환. |
+| FlinkDeployment 생성 실패 | 생성된 ConfigMap 삭제 후 에러 반환. |
 | ownerRef 패치 실패 | 경고 로그. FlinkDeployment는 성공적으로 생성됨. ownerRef 없이도 동작하나, 삭제 시 수동 정리 필요. 백그라운드 재시도. |
 
 ```
@@ -339,19 +347,12 @@ Admin API는 생성 전 FlinkDeployment 존재 여부를 확인하는 것이 아
 try:
     cm = createConfigMap(pipelineYaml)
     try:
-        secret = createSecret(credentials)  // 선택적
+        fd = createFlinkDeployment(spec, cm)
         try:
-            fd = createFlinkDeployment(spec, cm, secret)
-            try:
-                patchOwnerRef(cm, fd)
-                patchOwnerRef(secret, fd)  // 선택적
-            catch:
-                log.warn("ownerRef 패치 실패, 수동 정리 필요할 수 있음")
-                // FlinkDeployment 생성은 성공이므로 에러를 전파하지 않음
+            patchOwnerRef(cm, fd)
         catch:
-            deleteSecret(secret)
-            deleteConfigMap(cm)
-            throw
+            log.warn("ownerRef 패치 실패, 수동 정리 필요할 수 있음")
+            // FlinkDeployment 생성은 성공이므로 에러를 전파하지 않음
     catch:
         deleteConfigMap(cm)
         throw
@@ -411,7 +412,7 @@ flink-cdc-admin:
 
 **사용한다** (추천).
 
-FlinkDeployment를 owner로 하여 ConfigMap과 Secret에 ownerReferences를 설정한다.
+FlinkDeployment를 owner로 하여 ConfigMap에 ownerReferences를 설정한다.
 
 ```yaml
 # ConfigMap
@@ -426,7 +427,7 @@ metadata:
 ```
 
 효과:
-- FlinkDeployment 삭제 → Kubernetes GC가 ConfigMap, Secret 자동 삭제.
+- FlinkDeployment 삭제 → Kubernetes GC가 ConfigMap 자동 삭제.
 - 별도 정리 로직 최소화.
 - "orphan" 리소스 방지.
 
@@ -456,7 +457,7 @@ app.kubernetes.io/name={jobName}
 
 삭제 API에서:
 1. FlinkDeployment 삭제 (primary).
-2. Label selector로 관련 ConfigMap/Secret 조회.
+2. Label selector로 관련 ConfigMap 조회.
 3. ownerReferences에 의해 이미 삭제 진행 중이면 무시.
 4. 남아있는 리소스가 있으면 명시적 삭제.
 
@@ -476,9 +477,6 @@ Base URL: /api/v1
 | `GET` | `/jobs` | 작업 목록 조회 | Query: namespace, status | 200 + JobSummary[] |
 | `GET` | `/jobs/{jobName}` | 작업 상세 조회 | — | 200 + JobDetail |
 | `DELETE` | `/jobs/{jobName}` | 작업 삭제 | — | 200 + {message} |
-| `GET` | `/connectors/sources` | 지원 소스 타입 목록 | — | 200 + ConnectorType[] |
-| `GET` | `/connectors/sinks` | 지원 싱크 타입 목록 | — | 200 + ConnectorType[] |
-| `GET` | `/connectors/{type}/schema` | 커넥터별 입력 스키마 | — | 200 + ConnectorSchema |
 
 ### 8.2 요청/응답 모델
 
@@ -487,45 +485,19 @@ Base URL: /api/v1
 ```json
 {
   "jobName": "mysql-to-kafka-orders",
-  "namespace": "flink-jobs",
-  "source": {
-    "type": "mysql",
-    "hostname": "mysql.prod.svc",
-    "port": 3306,
-    "username": "cdc_user",
-    "password": "secret",
-    "tables": "app_db.\\.*",
-    "serverId": "5400-5404",
-    "serverTimeZone": "UTC"
-  },
-  "sink": {
-    "type": "kafka",
-    "properties": {
-      "bootstrap.servers": "kafka:9092"
-    }
-  },
-  "routes": [
-    {
-      "sourceTable": "app_db.orders",
-      "sinkTable": "orders-topic",
-      "description": "sync orders"
-    }
-  ],
-  "transforms": [],
-  "pipeline": {
-    "parallelism": 2,
-    "schemaChangeBehavior": "evolve"
-  },
+  "pipelineYaml": "source:\n  type: mysql\n  hostname: mysql.prod.svc\n  port: 3306\n  username: cdc_user\n  password: secret\n  tables: app_db.\\.*\n  server-id: 5400-5404\nsink:\n  type: kafka\n  properties.bootstrap.servers: kafka:9092\nroute:\n  - source-table: app_db.orders\n    sink-table: orders-topic\npipeline:\n  name: mysql-to-kafka-orders\n  parallelism: 2",
+  "flinkImage": "my-registry/flink-cdc:3.3.0-mysql-kafka",
   "resources": {
     "jobManager": { "cpu": 1, "memory": "1024m" },
     "taskManager": { "cpu": 1, "memory": "2048m", "replicas": 2 }
   },
+  "parallelism": 2,
   "flink": {
-    "image": "flink-cdc:3.3.0",
     "version": "v1_18",
     "serviceAccount": "flink",
     "extraConfig": {}
-  }
+  },
+  "namespace": "flink-jobs"
 }
 ```
 
@@ -536,8 +508,7 @@ Base URL: /api/v1
   "jobName": "mysql-to-kafka-orders",
   "namespace": "flink-jobs",
   "status": "RUNNING",
-  "sourceType": "mysql",
-  "sinkType": "kafka",
+  "flinkImage": "my-registry/flink-cdc:3.3.0-mysql-kafka",
   "createdAt": "2026-02-13T12:00:00Z",
   "parallelism": 2
 }
@@ -550,10 +521,14 @@ Base URL: /api/v1
   "jobName": "mysql-to-kafka-orders",
   "namespace": "flink-jobs",
   "status": "RUNNING",
-  "sourceType": "mysql",
-  "sinkType": "kafka",
+  "flinkImage": "my-registry/flink-cdc:3.3.0-mysql-kafka",
   "createdAt": "2026-02-13T12:00:00Z",
-  "spec": { "... 원본 입력 데이터 요약 ..." },
+  "pipelineYaml": "source:\n  type: mysql\n  ...",
+  "resources": {
+    "jobManager": { "cpu": 1, "memory": "1024m" },
+    "taskManager": { "cpu": 1, "memory": "2048m", "replicas": 2 }
+  },
+  "parallelism": 2,
   "kubernetes": {
     "lifecycleState": "STABLE",
     "jobManagerDeploymentStatus": "READY",
@@ -657,28 +632,28 @@ Checkpoint 복구의 경우:
 
 ### 9.3 Upgrade 전략
 
-작업 설정 변경 (이미지 업데이트, parallelism 변경, 파이프라인 변경 등):
+작업 설정 변경 (이미지 업데이트, parallelism 변경, Pipeline YAML 변경 등):
 
 ```
 PUT /api/v1/jobs/{jobName}
 
 {
-  "upgradeMode": "savepoint",  // "stateless" | "savepoint" | "last-state"
-  "changes": {
-    "pipeline": { "parallelism": 4 },
-    "resources": { "taskManager": { "memory": "4096m" } },
-    "flink": { "image": "flink-cdc:3.4.0" }
-  }
+  "upgradeMode": "savepoint",
+  "pipelineYaml": "... (새 YAML, 선택적) ...",
+  "flinkImage": "my-registry/flink-cdc:3.4.0",
+  "resources": { "taskManager": { "memory": "4096m" } },
+  "parallelism": 4
 }
 ```
 
 Admin API 처리 흐름:
-1. 변경된 필드에 따라 ConfigMap 업데이트 (파이프라인 변경 시) 또는 FlinkDeployment spec 패치.
-2. Operator가 `upgradeMode`에 따라 처리:
+1. Pipeline YAML이 변경된 경우 ConfigMap을 업데이트.
+2. FlinkDeployment spec을 패치 (이미지, 리소스, parallelism 등).
+3. Operator가 `upgradeMode`에 따라 처리:
    - `stateless`: 즉시 재시작 (상태 손실).
    - `savepoint`: savepoint 생성 → 재시작 → savepoint에서 복구.
    - `last-state`: 최신 checkpoint에서 재시작.
-3. 상태 전이: `RUNNING` → `UPGRADING` → `RUNNING` (또는 `ROLLING_BACK` → `ROLLED_BACK`).
+4. 상태 전이: `RUNNING` → `UPGRADING` → `RUNNING` (또는 `ROLLING_BACK` → `ROLLED_BACK`).
 
 필요한 변경:
 | 변경 항목 | 내용 |
@@ -686,7 +661,7 @@ Admin API 처리 흐름:
 | API | `PUT /api/v1/jobs/{jobName}` 엔드포인트 |
 | Backend | ConfigMap 업데이트 + FlinkDeployment spec 패치 로직 |
 | Backend | `upgradeMode` 선택에 따른 분기 처리 |
-| UI | "설정 변경" 폼 + `upgradeMode` 드롭다운 |
+| UI | "설정 변경" 폼 (새 Pipeline YAML, 이미지, 리소스) + `upgradeMode` 드롭다운 |
 | 상태 모델 | `UPGRADING`, `ROLLING_BACK`, `ROLLED_BACK` 상태가 이미 정의됨 |
 
 ---
@@ -699,9 +674,9 @@ flink-cdc-admin/
 │   ├── src/
 │   │   ├── api/                       # API 클라이언트
 │   │   ├── components/                # UI 컴포넌트
-│   │   │   ├── JobCreateForm/         # 작업 생성 폼
+│   │   │   ├── JobCreateForm/         # 작업 생성 폼 (YAML 입력, 이미지 선택, 리소스 설정)
 │   │   │   ├── JobList/               # 작업 목록
-│   │   │   └── JobDetail/             # 작업 상세
+│   │   │   └── JobDetail/             # 작업 상세 (Pipeline YAML 뷰어 포함)
 │   │   ├── hooks/                     # 커스텀 훅 (polling 등)
 │   │   ├── types/                     # TypeScript 타입 정의
 │   │   └── pages/                     # 페이지 컴포넌트
@@ -714,11 +689,10 @@ flink-cdc-admin/
 │   │       ├── controller/            # REST 컨트롤러
 │   │       ├── service/               # 비즈니스 로직
 │   │       │   ├── JobService.kt      # 작업 CRUD
-│   │       │   ├── YamlGenerator.kt   # Pipeline YAML 생성
 │   │       │   └── StatusMapper.kt    # K8s → UI 상태 매핑
 │   │       ├── kubernetes/            # K8s 클라이언트 래퍼
 │   │       │   ├── FlinkDeploymentClient.kt
-│   │       │   └── ResourceBuilder.kt # ConfigMap/CR 빌더
+│   │       │   └── ResourceBuilder.kt # ConfigMap/FlinkDeployment 빌더
 │   │       ├── model/                 # 도메인 모델
 │   │       │   ├── CreateJobRequest.kt
 │   │       │   ├── JobSummary.kt
@@ -762,10 +736,8 @@ metadata:
     flink-cdc-admin/version: v0
   annotations:
     flink-cdc-admin/created-at: "2026-02-13T12:00:00Z"
-    flink-cdc-admin/source-type: mysql
-    flink-cdc-admin/sink-type: kafka
 spec:
-  image: flink-cdc:3.3.0
+  image: my-registry/flink-cdc:3.3.0-mysql-kafka
   imagePullPolicy: IfNotPresent
   flinkVersion: v1_18
   serviceAccount: flink
@@ -837,19 +809,13 @@ data:
       password: secret
       tables: app_db.\.*
       server-id: 5400-5404
-      server-time-zone: UTC
-
     sink:
       type: kafka
       properties.bootstrap.servers: kafka:9092
-
     route:
       - source-table: app_db.orders
         sink-table: orders-topic
-        description: sync orders
-
     pipeline:
       name: mysql-to-kafka-orders
       parallelism: 2
-      schema.change.behavior: evolve
 ```
