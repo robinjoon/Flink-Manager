@@ -2,6 +2,12 @@ spring:
   application:
     name: api
 
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
 flink-cdc-admin:
   kubernetes:
     namespace: flink-jobs
