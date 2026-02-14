@@ -13,37 +13,38 @@
 - UI를 통한 전체 사용자 시나리오 검증
 - RBAC 권한 정상 동작 확인
 
+> **테스트 범위**: 이 테스트는 Admin Tool의 K8s 리소스 관리 기능(ConfigMap, FlinkDeployment CR의 생성/조회/삭제)을 검증한다. Flink CDC 파이프라인의 실제 실행(MySQL → Kafka 데이터 동기화 등)은 테스트 범위 밖이다. kind 클러스터에는 실제 소스/싱크 인프라가 없으므로, Job 상태는 DEPLOYING 이후 FAILED로 전이되는 것이 정상이다.
+
 ### 1.2 아키텍처
 
-```
-┌───────── kind 클러스터 ─────────────────────────────────────┐
-│                                                              │
-│  namespace: flink-cdc-admin                                  │
-│  ┌──────────────────────────────────────────┐                │
-│  │  Pod: flink-cdc-admin                     │                │
-│  │  ┌──────────────┐  ┌──────────────────┐  │                │
-│  │  │  frontend     │  │  backend          │  │                │
-│  │  │  (Next.js)    │──│  (Spring Boot)    │  │                │
-│  │  │  :3000        │  │  :8080            │  │                │
-│  │  └──────────────┘  └────────┬─────────┘  │                │
-│  └─────────────────────────────│─────────────┘                │
-│                                │ fabric8 client               │
-│  namespace: flink-jobs         ▼                              │
-│  ┌─────────────────────────────────────────┐                 │
-│  │  K8s API Server                          │                 │
-│  │  ├── ConfigMap (Pipeline YAML)           │                 │
-│  │  └── FlinkDeployment CR                  │                 │
-│  └──────────────────┬──────────────────────┘                 │
-│                     │                                         │
-│  ┌──────────────────▼──────────────────────┐                 │
-│  │  Flink Kubernetes Operator               │                 │
-│  │  └── JM Pod, TM Pod(s), Service 생성     │                 │
-│  └─────────────────────────────────────────┘                 │
-└──────────────────────────────────────────────────────────────┘
-         │
-         │ kubectl port-forward :3000
-         ▼
-    브라우저 (http://localhost:3000)
+```mermaid
+graph TD
+    subgraph kind["kind 클러스터"]
+        subgraph ns_admin["namespace: flink-cdc-admin"]
+            subgraph pod["Pod: flink-cdc-admin"]
+                frontend["frontend<br/>(Next.js :3000)"]
+                backend["backend<br/>(Spring Boot :8080)"]
+            end
+        end
+
+        subgraph ns_jobs["namespace: flink-jobs"]
+            api_server["K8s API Server"]
+            configmap["ConfigMap<br/>(Pipeline YAML)"]
+            flinkdep["FlinkDeployment CR"]
+            operator["Flink Kubernetes Operator"]
+            flink_pods["JM Pod, TM Pod(s), Service"]
+        end
+    end
+
+    browser["브라우저<br/>(http://localhost:3000)"]
+
+    frontend -- "localhost" --> backend
+    backend -- "fabric8 client" --> api_server
+    api_server --> configmap
+    api_server --> flinkdep
+    flinkdep --> operator
+    operator --> flink_pods
+    browser -- "kubectl port-forward :3000" --> frontend
 ```
 
 **핵심 포인트**: 같은 Pod 내 컨테이너는 `localhost`를 공유한다. 프론트엔드의 `next.config.ts`가 이미 `/api/*` 요청을 `localhost:8080`으로 프록시하므로, Pod 내에서 별도 설정 변경 없이 동작한다.
@@ -208,19 +209,21 @@ kubectl create namespace flink-jobs
 ### 4.3 Flink Kubernetes Operator 설치
 
 ```bash
-# cert-manager 설치 (Operator 의존성)
-kubectl apply -f https://github.com/jetstack/cert-manager/releases/latest/download/cert-manager.yaml
+# cert-manager 설치 (Operator 의존성) - 버전 고정
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml
 kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
 
 # Flink Operator Helm 레포 추가
-helm repo add flink-operator https://downloads.apache.org/flink/flink-kubernetes-operator-1.10.0/
+# 공식 URL. 접근 불가 시 Apache archive 사용: https://archive.apache.org/dist/flink/flink-kubernetes-operator-1.14.0/
+helm repo add flink-operator https://downloads.apache.org/flink/flink-kubernetes-operator-1.14.0/
 helm repo update
 
-# Flink Operator 설치 (flink-jobs 네임스페이스 watch)
+# Flink Operator 설치 (flink-jobs 네임스페이스 watch) - 버전 명시
 helm install flink-kubernetes-operator flink-operator/flink-kubernetes-operator \
   --namespace flink-operator-system \
   --create-namespace \
-  --set watchNamespaces="{flink-jobs}"
+  --set watchNamespaces="{flink-jobs}" \
+  --version 1.14.0
 ```
 
 설치 확인:
@@ -502,11 +505,18 @@ curl http://localhost:8080/api/v1/jobs
    - **Pipeline YAML**:
      ```yaml
      source:
-       type: values
-       name: ValuesSource
+       type: mysql
+       name: mysql-source
+       hostname: mysql.database.svc.cluster.local
+       port: 3306
+       username: root
+       password: root
+       tables: test_db.\*
+       server-id: 5400-5404
      sink:
-       type: values
-       name: ValuesSink
+       type: kafka
+       name: kafka-sink
+       properties.bootstrap.servers: kafka.messaging.svc.cluster.local:9092
      pipeline:
        name: test-pipeline
        parallelism: 1
@@ -520,7 +530,8 @@ curl http://localhost:8080/api/v1/jobs
 
 **예상 결과**:
 - 201 Created 응답
-- 상세 페이지에서 Status: DEPLOYING 표시
+- 상세 페이지에서 Status: DEPLOYING 표시 → 이후 FAILED 전이 (kind 클러스터에 실제 MySQL/Kafka가 없으므로 정상)
+- **핵심 검증 포인트**: ConfigMap과 FlinkDeployment CR이 올바르게 생성되었는가
 - K8s 리소스 생성 확인:
 
 ```bash
@@ -579,12 +590,14 @@ curl -X POST http://localhost:8080/api/v1/jobs \
 **절차**:
 1. http://localhost:3000 접속
 2. 테이블에 `test-mysql-to-kafka` 작업 표시 확인
-3. Status 뱃지 확인 (DEPLOYING → 시간 경과 후 RUNNING 또는 FAILED)
+3. Status 뱃지 확인 (DEPLOYING → FAILED)
 4. 5초 폴링으로 상태 자동 갱신 확인
 
 **예상 결과**:
 - 작업 이름, 상태, 이미지, 병렬도, 생성 시각이 테이블에 표시
-- 상태가 자동으로 갱신됨
+- 상태가 DEPLOYING → FAILED로 전이됨 (kind 클러스터에 실제 소스/싱크가 없으므로 정상)
+- Flink Job 상태와 Admin Tool의 상태 표시가 일치하는지 확인
+- 상태가 5초 폴링으로 자동 갱신됨
 
 ---
 
@@ -604,6 +617,8 @@ curl -X POST http://localhost:8080/api/v1/jobs \
 **예상 결과**:
 - 모든 섹션에 데이터가 올바르게 표시
 - Pipeline YAML이 원본 그대로 표시
+- lifecycleState가 FAILED 상태 (kind 클러스터에 실제 소스/싱크가 없으므로 정상)
+- Flink Job 상태와 Admin Tool의 상태 표시가 일치하는지 확인
 - 5초 간격으로 상태 자동 갱신
 
 **API 직접 확인**:
@@ -675,19 +690,21 @@ kubectl create namespace flink-cdc-admin
 kubectl create namespace flink-jobs
 echo ""
 
-echo "=== 3. cert-manager 설치 ==="
-kubectl apply -f https://github.com/jetstack/cert-manager/releases/latest/download/cert-manager.yaml
+echo "=== 3. cert-manager 설치 (v1.17.1) ==="
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml
 echo "cert-manager 준비 대기 중..."
 kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=180s
 echo ""
 
-echo "=== 4. Flink Operator 설치 ==="
-helm repo add flink-operator https://downloads.apache.org/flink/flink-kubernetes-operator-1.10.0/ || true
+echo "=== 4. Flink Operator 설치 (v1.14.0) ==="
+# 공식 URL. 접근 불가 시 Apache archive 사용: https://archive.apache.org/dist/flink/flink-kubernetes-operator-1.14.0/
+helm repo add flink-operator https://downloads.apache.org/flink/flink-kubernetes-operator-1.14.0/ || true
 helm repo update
 helm install flink-kubernetes-operator flink-operator/flink-kubernetes-operator \
   --namespace flink-operator-system \
   --create-namespace \
   --set watchNamespaces="{flink-jobs}" \
+  --version 1.14.0 \
   --wait --timeout 180s
 echo ""
 
